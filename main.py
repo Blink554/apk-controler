@@ -1,16 +1,20 @@
 import socket
-import threading
+import asyncio
 import flet as ft
 
-def main(page: ft.Page):
+async def main(page: ft.Page):
     page.title = "SCADA Remote Control"
     page.bgcolor = "#F8FAFC"  
     page.padding = 20
     page.theme_mode = ft.ThemeMode.LIGHT
     page.scroll = ft.ScrollMode.AUTO  
 
+    # Internal state tracker for the BigBag counter
+    bigbag_count = 0
+
     # Initialize client network socket
     udp_client = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    udp_client.setblocking(False)  
     try:
         udp_client.bind(("0.0.0.0", 61235))
     except Exception as e:
@@ -23,13 +27,27 @@ def main(page: ft.Page):
         bgcolor=ft.Colors.BLUE_GREY_300,
         border_radius=6
     )
-    status_text = ft.Text("UNKNOWN (WAITING FOR CLICK)", size=13, weight=ft.FontWeight.W_500, color=ft.Colors.BLUE_GREY_700)
+    status_text = ft.Text("UNKNOWN (WAITING FOR DATA)", size=13, weight=ft.FontWeight.W_500, color=ft.Colors.BLUE_GREY_700)
 
-    def listen_for_pc():
+    # --- COUNTER DISPLAY WIDGET ---
+    counter_text = ft.Text(str(bigbag_count), size=32, weight=ft.FontWeight.BOLD, color=ft.Colors.BLUE_700)
+
+    # --- FIXED: ASYNC COUNTER MECHANICS ---
+    async def adjust_counter(delta):
+        nonlocal bigbag_count
+        bigbag_count += delta
+        if bigbag_count < 0:  
+            bigbag_count = 0
+        counter_text.value = str(bigbag_count)
+        page.update()
+
+    # --- NATIVE ASYNC BACKGROUND LISTENER LOOP ---
+    async def listen_for_pc_async():
+        loop = asyncio.get_running_loop()
         while True:
             try:
-                data, _ = udp_client.recvfrom(1024)
-                message = data.decode('utf-8')
+                data, _ = await loop.sock_recvfrom(udp_client, 1024)
+                message = data.decode('utf-8').strip()
                 
                 if message == "STATUS_GREEN":
                     status_dot.bgcolor = ft.Colors.GREEN_500
@@ -39,10 +57,10 @@ def main(page: ft.Page):
                     status_text.value = "MOTOR OFF"
                 
                 page.update()
-            except:
-                break
-
-    threading.Thread(target=listen_for_pc, daemon=True).start()
+                
+            except Exception as e:
+                print(f"Async network listener error: {e}")
+                await asyncio.sleep(0.5)
 
     # --- INPUT FIELDS ---
     ip_input = ft.TextField(
@@ -55,18 +73,8 @@ def main(page: ft.Page):
         border_radius=10, border_color=ft.Colors.BLUE_GREY_200, focused_border_color=ft.Colors.BLUE_700,
         text_align=ft.TextAlign.CENTER, height=55
     )
-    x_input = ft.TextField(
-        label="Target X Coord", value="1000", prefix_icon=ft.Icons.SUBDIRECTORY_ARROW_RIGHT,
-        border_radius=10, border_color=ft.Colors.BLUE_GREY_200, focused_border_color=ft.Colors.BLUE_700,
-        text_align=ft.TextAlign.CENTER, height=55, expand=True
-    )
-    y_input = ft.TextField(
-        label="Target Y Coord", value="500", prefix_icon=ft.Icons.SOUTH_EAST,
-        border_radius=10, border_color=ft.Colors.BLUE_GREY_200, focused_border_color=ft.Colors.BLUE_700,
-        text_align=ft.TextAlign.CENTER, height=55, expand=True
-    )
 
-    def trigger_feeding(e):
+    async def trigger_feeding(e):
         try:
             status_dot.bgcolor = ft.Colors.AMBER_500
             status_text.value = "CHECKING HMI PIXEL STATUS..."
@@ -74,12 +82,14 @@ def main(page: ft.Page):
 
             target_ip = ip_input.value.strip()
             target_port = int(port_input.value.strip())
-            payload = f"start_motor:{x_input.value.strip()}:{y_input.value.strip()}"
-            udp_client.sendto(payload.encode('utf-8'), (target_ip, target_port))
+            payload = "start_motor:trigger"
+            
+            loop = asyncio.get_running_loop()
+            await loop.sock_sendto(udp_client, payload.encode('utf-8'), (target_ip, target_port))
         except Exception as err:
-            print(f"Network error: {err}")
+            print(f"Network click transmit error: {err}")
 
-    # --- CARD LAYOUTS ---
+    # --- LAYOUT CARDS CONFIGURATION ---
     status_card = ft.Container(
         content=ft.Column([
             ft.Text("SYSTEM FEEDBACK", size=12, weight=ft.FontWeight.BOLD, color=ft.Colors.BLUE_GREY_400),
@@ -96,20 +106,30 @@ def main(page: ft.Page):
         padding=20, bgcolor=ft.Colors.WHITE, border_radius=15, shadow=ft.BoxShadow(blur_radius=10, color="#E2E8F0")
     )
 
-    coordinates_card = ft.Container(
+    # FIXED: Wrapped button actions inside lambda expressions using page.run_task to handle the async math cleanly
+    counter_card = ft.Container(
         content=ft.Column([
-            ft.Text("SCADA CLICK TARGETS", size=12, weight=ft.FontWeight.BOLD, color=ft.Colors.BLUE_GREY_400),
-            ft.Row([x_input, y_input], spacing=10)
-        ], spacing=15),
+            ft.Text("BIGBAG STOCK COUNTER", size=12, weight=ft.FontWeight.BOLD, color=ft.Colors.BLUE_GREY_400),
+            ft.Row([
+                ft.IconButton(
+                    icon=ft.Icons.REMOVE_CIRCLE_OUTLINE, 
+                    icon_color=ft.Colors.RED_500, 
+                    icon_size=36,
+                    on_click=lambda e: page.run_task(adjust_counter, -1)
+                ),
+                ft.Container(content=counter_text, alignment=ft.Alignment(0, 0), width=100),
+                ft.IconButton(
+                    icon=ft.Icons.ADD_CIRCLE_OUTLINE, 
+                    icon_color=ft.Colors.GREEN_500, 
+                    icon_size=36,
+                    on_click=lambda e: page.run_task(adjust_counter, 1)
+                ),
+            ], alignment=ft.MainAxisAlignment.CENTER, spacing=20)
+        ], spacing=10),
         padding=20, bgcolor=ft.Colors.WHITE, border_radius=15, shadow=ft.BoxShadow(blur_radius=10, color="#E2E8F0")
     )
 
-    # --- VISUAL ASSET DESIGNATED FOR INSIDE CONTROL CARD ---
-    bigbag_image = ft.Image(
-        src="bigbag.png",
-        height=160,          # Sized down slightly so everything fits comfortably together
-        fit="contain"
-    )
+    bigbag_image = ft.Image(src="bigbag.png", height=160, fit="contain")
 
     feeding_button = ft.FilledButton(
         "BIGBAG FEEDING", icon=ft.Icons.PLAY_ARROW_ROUNDED,
@@ -117,29 +137,26 @@ def main(page: ft.Page):
         on_click=trigger_feeding, expand=True, height=65
     )
 
-    # Process Card Wrapper (Updated: Stacks Image neatly above the button row)
     control_card = ft.Container(
         content=ft.Column([
             ft.Text("PROCESS CONTROL", size=12, weight=ft.FontWeight.BOLD, color=ft.Colors.BLUE_GREY_400),
-            ft.Row([bigbag_image], alignment=ft.MainAxisAlignment.CENTER), # Image placed above
-            ft.Row([feeding_button], alignment=ft.MainAxisAlignment.CENTER) # Button row immediately below
+            ft.Row([bigbag_image], alignment=ft.MainAxisAlignment.CENTER), 
+            ft.Row([feeding_button], alignment=ft.MainAxisAlignment.CENTER) 
         ], spacing=15),
-        padding=20,
-        bgcolor=ft.Colors.WHITE,
-        border_radius=15,
-        shadow=ft.BoxShadow(blur_radius=10, color="#E2E8F0")
+        padding=20, bgcolor=ft.Colors.WHITE, border_radius=15, shadow=ft.BoxShadow(blur_radius=10, color="#E2E8F0")
     )
 
-    # --- Assemble Layout Vertically ---
     page.add(
         ft.Column([
             ft.Container(height=5),
             status_card,
             network_card,
-            coordinates_card,
+            counter_card,
             control_card
         ], spacing=15, alignment=ft.MainAxisAlignment.START)
     )
+
+    page.run_task(listen_for_pc_async)
 
 if __name__ == "__main__":
     ft.run(main, assets_dir="assets")
